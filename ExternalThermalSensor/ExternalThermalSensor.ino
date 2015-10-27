@@ -5,14 +5,18 @@
 */
 #include <JeeLib.h>
 #include <XBee.h>
-#include <limits.h>
 #include <AltSoftSerial.h>
 
 ISR(WDT_vect) { Sleepy::watchdogEvent(); } // Setup the watchdog
 
+const bool prefer_sleep = false;
+
 // XBee variables
 AltSoftSerial xbeeSerial;  // The software serial port for communicating with the Xbee (TX Pin 9, RX Pin 8)
 XBee localRadio = XBee();  // The connection for the local coordinating radio
+
+// XBee command codes
+const uint8_t CMD_SENSOR_DATA = 4;
 
 // XBee data codes
 const uint8_t TEMPERATURE_CODE = 1;
@@ -25,11 +29,10 @@ const uint8_t HEATING_CODE = 7;
 const uint8_t THERMOSTAT_CODE = 8;
 const uint8_t TEMP_12BYTE_CODE = 9;
 
-// Determine the maximum unsigned long
-const unsigned long MAX_LONG = ULONG_MAX;
-
 // Timing variables
-const unsigned long TEMP_PERIOD = 600000;  // The period between temperature measurements (ms).
+const unsigned long SENSOR_DELAY = 15000;	// The period between temperature measurements (ms).
+const unsigned long STARTUP_DELAY = 3000;	// The period allowed for component warmup and initialization (ms).
+const unsigned long COMM_DELAY = 1000;		// The period allowed for XBee communications to initialize/finalize (ms).
 
 // Local pins
 const int LOCAL_POWER_PIN = A0;	// The analog pin that measures the power supply
@@ -42,44 +45,70 @@ union FloatConverter {
 	uint8_t b[sizeof(float)];
 };
 
-
-// the setup function runs once when you press reset or power the board
+//=============================================================================
+// SETUP
+//=============================================================================
 void setup() {
+	// Initialize the pins
 	pinMode(POWER_PIN, OUTPUT);		// Set the power pin to digital output
 	digitalWrite(POWER_PIN, LOW);	// Turn off the power
+
+	// Setup the serial communications
+	Serial.begin(9600);
+	Serial.println("Starting service...");
 }
 
-// the loop function runs over and over again until power down or reset
+//=============================================================================
+// MAIN LOOP
+//=============================================================================
 void loop() {
+	//-------------------------------------------------------------------------
+	// POWER UP COMPONENTS
+	//-------------------------------------------------------------------------
 	// Turn on the power to the attached components
 	digitalWrite(POWER_PIN, HIGH);
+	SmartDelay(STARTUP_DELAY, true);	// Warmup delay
 
-	// Power up the XBee
+	// Connect to the XBee
+	Serial.print("Starting XBee connection...");
 	xbeeSerial.begin(9600);
 	localRadio.setSerial(xbeeSerial);
+	Serial.println("FINISHED");
 
+	// Delay while components power up
+	//	Sleepy::loseSomeTime(5000);
+	SmartDelay(COMM_DELAY, true);
+
+	//-------------------------------------------------------------------------
+	// COLLECT SENSOR DATA
+	//-------------------------------------------------------------------------
 	// Read the power
 	FloatConverter Power;
 	int powerSignal = analogRead(LOCAL_POWER_PIN);
-	Power.f = 3.7*powerSignal/1023.0;
+	Power.f = 5.0*powerSignal / 1023.0;
 
-	// Create the byte array to pass through the XBee
+
+	//-------------------------------------------------------------------------
+	// SEND DATA THROUGH XBEE
+	//-------------------------------------------------------------------------
+	// Create the byte array to pass to the XBee
 	size_t floatBytes = sizeof(float);
-	uint8_t package[1 + floatBytes];
-	package[0] = POWER_CODE;
+	uint8_t package[2 + floatBytes];
+	package[0] = CMD_SENSOR_DATA;
+	package[1] = POWER_CODE;
 	for (int i = 0; i < floatBytes; i++) {
-		package[i + 1] = Power.b[i];
+		package[i + 2] = Power.b[i];
 	}
 
-	// Send the data package to the coordinator
+	// Send the data package to the coordinator through the XBee
 	XBeeAddress64 address = XBeeAddress64(0x00000000, 0x00000000);
 	ZBTxRequest zbTX = ZBTxRequest(address, package, sizeof(package));
 	localRadio.send(zbTX);
 
-/*	// Print message to the serial port
+	// Print message to the serial port
 	Serial.print("Sent the following message (");
-	Serial.print(Temperature.f);
-	Serial.print(",");
+	/*	Serial.print(Temperature.f);
+		Serial.print(",");*/
 	Serial.print(Power.f);
 	Serial.print("): ");
 	for (int i = 0; i < sizeof(package); i++) {
@@ -87,10 +116,29 @@ void loop() {
 		Serial.print(package[i], HEX);
 	}
 	Serial.println("");
-*/
 
+	// Transmission delay
+	SmartDelay(COMM_DELAY, true);
+
+	//-------------------------------------------------------------------------
+	// POWER DOWN COMPONENTS AND WAIT FOR NEXT CYCLE
+	//-------------------------------------------------------------------------
 	// Turn off the power to the components and sleep
 	xbeeSerial.end();	// Turn off the serial communication with the xbee
 	digitalWrite(POWER_PIN, LOW);
-	Sleepy::loseSomeTime(TEMP_PERIOD);
+
+	// Cycle delay
+	SmartDelay(SENSOR_DELAY);
+}
+
+
+//=============================================================================
+// SmartDelay
+//=============================================================================
+void SmartDelay(unsigned long delay_time, bool force_delay = false) {
+	if(force_delay) delay(delay_time);	// the user is selecting a delay and not sleeping
+	else {
+		if(prefer_sleep) Sleepy::loseSomeTime(delay_time);
+		else delay(delay_time);
+	}
 }
