@@ -3,13 +3,16 @@
  Created:	9/25/2015 11:06:53 PM
  Author:	Tim Lampman
 */
+#include <Wire.h>
+#include <LumSensor.h>
+#include <HTU21D.h>
 #include <JeeLib.h>
 #include <XBee.h>
 #include <AltSoftSerial.h>
 
 ISR(WDT_vect) { Sleepy::watchdogEvent(); } // Setup the watchdog
 
-const bool prefer_sleep = false;
+const bool prefer_sleep = true;
 
 // XBee variables
 AltSoftSerial xbeeSerial;  // The software serial port for communicating with the Xbee (TX Pin 9, RX Pin 8)
@@ -34,6 +37,10 @@ const unsigned long SENSOR_DELAY = 15000;	// The period between temperature meas
 const unsigned long STARTUP_DELAY = 3000;	// The period allowed for component warmup and initialization (ms).
 const unsigned long COMM_DELAY = 1000;		// The period allowed for XBee communications to initialize/finalize (ms).
 
+// Sensor objects
+HTU21D airSensor;
+AutoLightSensor luxSensor;
+
 // Local pins
 const int LOCAL_POWER_PIN = A0;	// The analog pin that measures the power supply
 
@@ -45,6 +52,8 @@ union FloatConverter {
 	uint8_t b[sizeof(float)];
 };
 
+void SmartDelay(unsigned long delay_time, bool force_delay);
+
 //=============================================================================
 // SETUP
 //=============================================================================
@@ -52,6 +61,9 @@ void setup() {
 	// Initialize the pins
 	pinMode(POWER_PIN, OUTPUT);		// Set the power pin to digital output
 	digitalWrite(POWER_PIN, LOW);	// Turn off the power
+
+	// Start the I2C interface
+	luxSensor.begin();
 
 	// Setup the serial communications
 	Serial.begin(9600);
@@ -67,7 +79,7 @@ void loop() {
 	//-------------------------------------------------------------------------
 	// Turn on the power to the attached components
 	digitalWrite(POWER_PIN, HIGH);
-	SmartDelay(STARTUP_DELAY, true);	// Warmup delay
+	SmartDelay(STARTUP_DELAY, false);	// Warmup delay
 
 	// Connect to the XBee
 	Serial.print("Starting XBee connection...");
@@ -76,8 +88,7 @@ void loop() {
 	Serial.println("FINISHED");
 
 	// Delay while components power up
-	//	Sleepy::loseSomeTime(5000);
-	SmartDelay(COMM_DELAY, true);
+	SmartDelay(COMM_DELAY, false);
 
 	//-------------------------------------------------------------------------
 	// COLLECT SENSOR DATA
@@ -85,19 +96,36 @@ void loop() {
 	// Read the power
 	FloatConverter Power;
 	int powerSignal = analogRead(LOCAL_POWER_PIN);
-	Power.f = 5.0*powerSignal / 1023.0;
+	Power.f = 3.3*powerSignal / 1023.0;
 
+	// Read the temperature
+	FloatConverter Temperature;
+	Temperature.f = airSensor.readTemperature();
+
+	// Read the humidity
+	FloatConverter Humidity;
+	Humidity.f = airSensor.readHumidity();
+
+	// Read the luminosity
+	FloatConverter Luminosity;
+	Luminosity.f = luxSensor.getLuminosity();
 
 	//-------------------------------------------------------------------------
 	// SEND DATA THROUGH XBEE
 	//-------------------------------------------------------------------------
 	// Create the byte array to pass to the XBee
 	size_t floatBytes = sizeof(float);
-	uint8_t package[2 + floatBytes];
+	uint8_t package[1 + 4*(floatBytes + 1)];
 	package[0] = CMD_SENSOR_DATA;
-	package[1] = POWER_CODE;
+	package[1] = TEMPERATURE_CODE;
+	package[1+(floatBytes + 1)] = HUMIDITY_CODE;
+	package[1+2*(floatBytes + 1)] = LUX_CODE;
+	package[1+3*(floatBytes + 1)] = POWER_CODE;
 	for (int i = 0; i < floatBytes; i++) {
-		package[i + 2] = Power.b[i];
+		package[i + 2] = Temperature.b[i];
+		package[i + 2 + (floatBytes + 1)] = Humidity.b[i];
+		package[i + 2 + 2*(floatBytes + 1)] = Luminosity.b[i];
+		package[i + 2 + 3*(floatBytes + 1)] = Power.b[i];
 	}
 
 	// Send the data package to the coordinator through the XBee
@@ -107,8 +135,12 @@ void loop() {
 
 	// Print message to the serial port
 	Serial.print("Sent the following message (");
-	/*	Serial.print(Temperature.f);
-		Serial.print(",");*/
+	Serial.print(Temperature.f);
+	Serial.print(",");
+	Serial.print(Humidity.f);
+	Serial.print(",");
+	Serial.print(Luminosity.f);
+	Serial.print(",");
 	Serial.print(Power.f);
 	Serial.print("): ");
 	for (int i = 0; i < sizeof(package); i++) {
@@ -118,7 +150,7 @@ void loop() {
 	Serial.println("");
 
 	// Transmission delay
-	SmartDelay(COMM_DELAY, true);
+	SmartDelay(COMM_DELAY, false);
 
 	//-------------------------------------------------------------------------
 	// POWER DOWN COMPONENTS AND WAIT FOR NEXT CYCLE
@@ -128,14 +160,14 @@ void loop() {
 	digitalWrite(POWER_PIN, LOW);
 
 	// Cycle delay
-	SmartDelay(SENSOR_DELAY);
+	SmartDelay(SENSOR_DELAY, false);
 }
 
 
 //=============================================================================
 // SmartDelay
 //=============================================================================
-void SmartDelay(unsigned long delay_time, bool force_delay = false) {
+void SmartDelay(unsigned long delay_time, bool force_delay) {
 	if(force_delay) delay(delay_time);	// the user is selecting a delay and not sleeping
 	else {
 		if(prefer_sleep) Sleepy::loseSomeTime(delay_time);
